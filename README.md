@@ -36,7 +36,7 @@ let res = reqwest::Client::new()
     .expect("send request");
 
 assert_eq!(res.status(), 200);
-assert_eq!(*val.lock().expect("lock poisoned"), 1235,);
+assert_eq!(*val.lock().expect("lock poisoned"), 1235);
 assert_eq!(res.text().await.expect("read response"), "1235");
 
 assert_eq!(server.req_count(), 1);

@@ -31,8 +31,8 @@ pub use hyper;
 /// Listens on a random port, running the given function to handle each request.
 ///
 /// ```
-/// # Please keep this example up-to-date with README.md, but remove the tokio
-/// # runtime and wrapping async block.
+/// # // Please keep this example up-to-date with README.md, but remove all
+/// # // lines starting with `#` and their contents.
 /// use std::sync::{Arc, Mutex};
 ///
 /// use mini_http_test::{
@@ -61,7 +61,7 @@ pub use hyper;
 ///     .expect("send request");
 ///
 /// assert_eq!(res.status(), 200);
-/// assert_eq!(*val.lock().expect("lock poisoned"), 1235,);
+/// assert_eq!(*val.lock().expect("lock poisoned"), 1235);
 /// assert_eq!(res.text().await.expect("read response"), "1235");
 ///
 /// assert_eq!(server.req_count(), 1);
