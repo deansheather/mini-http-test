@@ -67,6 +67,7 @@ pub use hyper;
 /// assert_eq!(server.req_count(), 1);
 /// # });
 /// ```
+#[derive(Debug)]
 pub struct Server {
     join_handle: tokio::task::JoinHandle<()>,
     addr: SocketAddr,

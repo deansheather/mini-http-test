@@ -3,6 +3,12 @@ name = "mini-http-test"
 version = "0.1.0"
 edition = "2021"
 
+license = "MIT"
+description = "A mini HTTP server for testing HTTP clients"
+authors = ["Dean Sheather <dean@deansheather.com>"]
+repository = "https://github.com/deansheather/mini-http-test"
+readme = "README.md"
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"

@@ -6,7 +6,7 @@ servers. Vaguely inspired by Go's
 
 Currently only supports HTTP/1.1 and does not support TLS.
 
-### Example
+## Example
 
 ```rust
 use std::sync::{Arc, Mutex};
@@ -42,6 +42,6 @@ assert_eq!(res.text().await.expect("read response"), "1235");
 assert_eq!(server.req_count(), 1);
 ```
 
-### License
+## License
 
 Licensed under the MIT license. See [LICENSE](LICENSE) for more details.
