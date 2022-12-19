@@ -31,6 +31,8 @@ pub use hyper;
 /// Listens on a random port, running the given function to handle each request.
 ///
 /// ```
+/// # Please keep this example up-to-date with README.md, but remove the tokio
+/// # runtime and wrapping async block.
 /// use std::sync::{Arc, Mutex};
 ///
 /// use mini_http_test::{
