@@ -1,6 +1,8 @@
 # mini-http-test
 
-![Crates.io](https://img.shields.io/crates/v/mini-http-test) ![docs.rs](https://img.shields.io/badge/docs.rs-mini--http--test-blue) ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/deansheather/mini-http-test/ci.yaml?branch=main)
+[![Crates.io](https://img.shields.io/crates/v/mini-http-test)](https://crates.io/crates/mini-http-test)
+[![docs.rs](https://img.shields.io/badge/docs.rs-mini__http__test-blue)](https://docs.rs/mini-http-test/latest/mini_http_test/)
+[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/deansheather/mini-http-test/ci.yaml?branch=main)](https://github.com/deansheather/mini-http-test/actions)
 
 Small library that provides a simple Hyper server wrapper for writing HTTP test
 servers. Vaguely inspired by Go's
