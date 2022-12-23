@@ -2,17 +2,58 @@
 //! servers. Vaguely inspired by Go's
 //! [httptest](https://pkg.go.dev/net/http/httptest#Server) package.
 //!
-//! Currently only supports HTTP/1.1 and does not support TLS.
+//! Currently only supports HTTP/1.1 and does not support TLS. Only supports the
+//! Tokio async runtime.
 //!
-//! See [Server](Server) for an example on how to use the server. There are also
-//! more examples as tests.
+//! ## Example
+//!
+//! ```
+//! # // Please keep this example up-to-date with README.md, but remove all
+//! # // lines starting with `#` and their contents.
+//! use std::sync::{Arc, Mutex};
+//!
+//! use mini_http_test::{
+//!     handle_ok,
+//!     hyper::{body, Request, Response},
+//!     Server,
+//! };
+//!
+//! # tokio::runtime::Runtime::new().unwrap().block_on(async {
+//! let val = Arc::new(Mutex::new(1234));
+//! let server = {
+//!     let val = val.clone();
+//!     Server::new(move |_: Request<body::Incoming>| async move {
+//!         let mut val = val.lock().expect("lock poisoned");
+//!         *val += 1;
+//!         handle_ok(Response::new(val.to_string().into()))
+//!     })
+//!     .await
+//!     .expect("create server")
+//! };
+//!
+//! let res = reqwest::Client::new()
+//!     .get(server.url("/").to_string())
+//!     .send()
+//!     .await
+//!     .expect("send request");
+//!
+//! assert_eq!(res.status(), 200);
+//! assert_eq!(*val.lock().expect("lock poisoned"), 1235);
+//! assert_eq!(res.text().await.expect("read response"), "1235");
+//!
+//! assert_eq!(server.req_count(), 1);
+//! # });
+//! ```
+//!
+//! There are also more examples as tests.
 
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use http_body_util::BodyExt;
 use hyper::{
@@ -21,7 +62,7 @@ use hyper::{
     service::service_fn,
     Request, Uri,
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, time::Instant};
 
 mod handler;
 pub use handler::*;
@@ -30,49 +71,15 @@ pub use hyper;
 
 /// Listens on a random port, running the given function to handle each request.
 ///
-/// ```
-/// # // Please keep this example up-to-date with README.md, but remove all
-/// # // lines starting with `#` and their contents.
-/// use std::sync::{Arc, Mutex};
-///
-/// use mini_http_test::{
-///     handle_ok,
-///     hyper::{body, Request, Response},
-///     Server,
-/// };
-///
-/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-/// let val = Arc::new(Mutex::new(1234));
-/// let server = {
-///     let val = val.clone();
-///     Server::new(move |_: Request<body::Incoming>| async move {
-///         let mut val = val.lock().expect("lock poisoned");
-///         *val += 1;
-///         handle_ok(Response::new(val.to_string().into()))
-///     })
-///     .await
-///     .expect("create server")
-/// };
-///
-/// let res = reqwest::Client::new()
-///     .get(server.url("/").to_string())
-///     .send()
-///     .await
-///     .expect("send request");
-///
-/// assert_eq!(res.status(), 200);
-/// assert_eq!(*val.lock().expect("lock poisoned"), 1235);
-/// assert_eq!(res.text().await.expect("read response"), "1235");
-///
-/// assert_eq!(server.req_count(), 1);
-/// # });
-/// ```
-#[derive(Debug)]
+/// See the crate documentation for an example.
+#[derive(Debug, Clone)]
 pub struct Server {
-    join_handle: tokio::task::JoinHandle<()>,
+    // This field is used so the runtime gets dropped when the last Server clone
+    // is dropped.
+    _runtime: Arc<tokio::runtime::Runtime>,
     addr: SocketAddr,
-
     req_count: Arc<Mutex<u64>>,
+    concurrent_req_count: Arc<Mutex<u64>>,
 }
 
 impl Server {
@@ -88,12 +95,23 @@ impl Server {
             .local_addr()
             .context("get listener socket address")?;
 
-        let req_count = Arc::new(Mutex::new(0));
-        let join_handle = {
-            let req_count = req_count.clone();
-            let handler = handler.clone();
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .context("build tokio runtime")?,
+        );
 
-            tokio::spawn(async move {
+        let req_count = Arc::new(Mutex::new(0));
+        let concurrent_req_count = Arc::new(Mutex::new(0));
+
+        {
+            let handler = handler.clone();
+            let req_count = req_count.clone();
+            let concurrent_req_count = concurrent_req_count.clone();
+
+            runtime.spawn(async move {
                 loop {
                     let (tcp_stream, _) = match tcp_listener.accept().await {
                         Ok((tcp_stream, addr)) => (tcp_stream, addr),
@@ -105,13 +123,18 @@ impl Server {
 
                     let handler = handler.clone();
                     let req_count = req_count.clone();
-                    tokio::task::spawn(async move {
+                    let concurrent_req_count = concurrent_req_count.clone();
+                    tokio::spawn(async move {
                         let handler = &handler;
                         let req_count = &req_count;
+                        let concurrent_req_count = &concurrent_req_count;
 
                         let service = service_fn(|req: Request<body::Incoming>| async move {
+                            *concurrent_req_count.lock().expect("lock poisoned") += 1;
+                            let res = run_handler(handler.clone(), req).await;
+                            *concurrent_req_count.lock().expect("lock poisoned") -= 1;
                             *req_count.lock().expect("lock poisoned") += 1;
-                            run_handler(handler.clone(), req).await
+                            res
                         });
 
                         if let Err(http_err) = http1::Builder::new()
@@ -123,13 +146,14 @@ impl Server {
                         }
                     });
                 }
-            })
+            });
         };
 
         Ok(Self {
-            join_handle,
+            _runtime: runtime,
             addr,
             req_count,
+            concurrent_req_count,
         })
     }
 
@@ -148,18 +172,74 @@ impl Server {
             .expect("should be a valid URL")
     }
 
-    /// Returns the number of requests received by the server.
+    /// Returns the number of requests handled by the server. This value is
+    /// incremented after the request handler has finished, but before the
+    /// response has been sent.
     ///
     /// At the end of tests, this should be asserted to be equal to the amount
     /// of requests sent.
     pub fn req_count(&self) -> u64 {
         *self.req_count.lock().expect("lock poisoned")
     }
-}
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.join_handle.abort();
+    /// Await req_count reaching a certain number. This polls every 10ms and
+    /// times out after the given duration.
+    pub async fn await_req_count(
+        &self,
+        count: u64,
+        timeout: Duration,
+    ) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
+        loop {
+            let current_count = self.req_count();
+            if current_count == count {
+                return Ok(());
+            }
+
+            if start.elapsed() > timeout {
+                bail!(
+                    "req_count did not reach {} (currently {}) within {:?}",
+                    count,
+                    current_count,
+                    timeout
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Returns the number of concurrent requests currently being handled by the
+    /// server.
+    pub fn concurrent_req_count(&self) -> u64 {
+        *self.concurrent_req_count.lock().expect("lock poisoned")
+    }
+
+    /// Await concurrent_req_count reaching a certain number. This polls every
+    /// 10ms and times out after the given duration.
+    pub async fn await_concurrent_req_count(
+        &self,
+        count: u64,
+        timeout: Duration,
+    ) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
+        loop {
+            let current_count = self.concurrent_req_count();
+            if current_count == count {
+                return Ok(());
+            }
+
+            if start.elapsed() > timeout {
+                bail!(
+                    "concurrent_req_count did not reach {} (currently {}) within {:?}",
+                    count,
+                    current_count,
+                    timeout
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -321,5 +401,55 @@ mod test {
         }
 
         assert_eq!(server.req_count(), ITERATIONS);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn server_long_requests_cancellation() {
+        async fn handler(
+            _: Request<body::Incoming>,
+        ) -> Result<Response<Full<Bytes>>, anyhow::Error> {
+            // Sleep for 10 seconds to simulate a long request.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(Response::new("hello world".into()))
+        }
+
+        let server = Server::new(handler).await.expect("create server");
+
+        let client = reqwest::Client::new();
+
+        // Spawn tasks that will send requests to the server.
+        static ITERATIONS: u64 = 10;
+        let url = server.url("/").to_string();
+        let futures: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = (0..ITERATIONS)
+            .map(|_| {
+                println!("spawning request");
+                let client = client.clone();
+                let url = url.clone();
+
+                tokio::spawn(async move {
+                    println!("sending request");
+                    let res = client.get(url).send().await;
+                    println!("res: {:?}", res);
+                    match res {
+                        Ok(_) => Err(anyhow::anyhow!("expected request to be canceled")),
+                        Err(_) => Ok(()),
+                    }
+                })
+            })
+            .collect();
+
+        server
+            .await_concurrent_req_count(ITERATIONS, Duration::from_secs(1))
+            .await
+            .expect("requests start");
+        assert_eq!(server.concurrent_req_count(), ITERATIONS);
+
+        // Drop the server and the requests should be canceled.
+        drop(server);
+
+        // Wait for the requests to be canceled.
+        for fut in futures {
+            fut.await.unwrap().expect("request canceled");
+        }
     }
 }
