@@ -62,7 +62,7 @@ use hyper::{
     service::service_fn,
     Request, Uri,
 };
-use tokio::{net::TcpListener, time::Instant};
+use tokio::{net::TcpListener, select, sync::watch, time::Instant};
 
 mod handler;
 pub use handler::*;
@@ -74,9 +74,7 @@ pub use hyper;
 /// See the crate documentation for an example.
 #[derive(Debug, Clone)]
 pub struct Server {
-    // This field is used so the runtime gets dropped when the last Server clone
-    // is dropped.
-    _runtime: Arc<tokio::runtime::Runtime>,
+    close_tx: Arc<watch::Sender<u8>>,
     addr: SocketAddr,
     req_count: Arc<Mutex<u64>>,
     concurrent_req_count: Arc<Mutex<u64>>,
@@ -86,6 +84,11 @@ impl Server {
     /// Creates a new HTTP server on a random port running the given handler.
     /// The handler will be called on every request, and the total request count
     /// can be retrieved with [server.req_count()](Server::req_count).
+    ///
+    /// The server can be safely cloned and used from multiple threads. When the
+    /// final reference to the server is dropped, the server will be shut down
+    /// and all pending requests will be aborted. Aborting the server will
+    /// happen in the background and will not block.
     pub async fn new<H: Handler + Clone + Send + Sync + 'static>(
         handler: H,
     ) -> Result<Self, anyhow::Error> {
@@ -95,14 +98,7 @@ impl Server {
             .local_addr()
             .context("get listener socket address")?;
 
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .context("build tokio runtime")?,
-        );
-
+        let (close_tx, close_rx) = watch::channel::<u8>(0);
         let req_count = Arc::new(Mutex::new(0));
         let concurrent_req_count = Arc::new(Mutex::new(0));
 
@@ -111,17 +107,27 @@ impl Server {
             let req_count = req_count.clone();
             let concurrent_req_count = concurrent_req_count.clone();
 
-            runtime.spawn(async move {
+            tokio::spawn(async move {
+                let mut close_rx = close_rx.clone();
+
                 loop {
-                    let (tcp_stream, _) = match tcp_listener.accept().await {
-                        Ok((tcp_stream, addr)) => (tcp_stream, addr),
-                        Err(err) => {
-                            eprintln!("Error while accepting TCP connection: {}", err);
+                    let (tcp_stream, _) = select! {
+                        _ = close_rx.changed() => {
                             return;
+                        }
+                        res = tcp_listener.accept() => {
+                            match res {
+                                Ok(res) => res,
+                                Err(err) => {
+                            eprintln!("Error while accepting TCP connection: {}", err);
+                                    return;
+                                }
+                            }
                         }
                     };
 
                     let handler = handler.clone();
+                    let mut close_rx = close_rx.clone();
                     let req_count = req_count.clone();
                     let concurrent_req_count = concurrent_req_count.clone();
                     tokio::spawn(async move {
@@ -137,11 +143,16 @@ impl Server {
                             res
                         });
 
-                        if let Err(http_err) = http1::Builder::new()
-                            .http1_keep_alive(true)
-                            .serve_connection(tcp_stream, service)
-                            .await
-                        {
+                        let res = select! {
+                            _ = close_rx.changed() => {
+                                return;
+                            }
+                            res = http1::Builder::new()
+                                .http1_keep_alive(true)
+                                .serve_connection(tcp_stream, service) => res,
+                        };
+
+                        if let Err(http_err) = res {
                             eprintln!("Error while serving HTTP connection: {}", http_err);
                         }
                     });
@@ -150,7 +161,7 @@ impl Server {
         };
 
         Ok(Self {
-            _runtime: runtime,
+            close_tx: Arc::new(close_tx),
             addr,
             req_count,
             concurrent_req_count,
@@ -239,6 +250,20 @@ impl Server {
             }
 
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// close kills the server and aborts all pending requests. This does not
+    /// block for all requests to finish.
+    pub fn close(&self) {
+        self.close_tx.send(1).expect("failed to close server");
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.close_tx) == 1 {
+            self.close();
         }
     }
 }
@@ -403,7 +428,46 @@ mod test {
         assert_eq!(server.req_count(), ITERATIONS);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn server_await_req_count() {
+        async fn handler(
+            _: Request<body::Incoming>,
+        ) -> Result<Response<Full<Bytes>>, anyhow::Error> {
+            Ok(Response::new("hello world".into()))
+        }
+
+        let server = Server::new(handler).await.expect("create server");
+
+        let client = reqwest::Client::new();
+
+        // Spawn tasks that will send requests to the server.
+        static ITERATIONS: u64 = 10;
+        let url = server.url("/").to_string();
+        let futures: Vec<tokio::task::JoinHandle<()>> = (0..ITERATIONS)
+            .map(|_| {
+                let client = client.clone();
+                let url = url.clone();
+
+                tokio::spawn(async move {
+                    let res = client.get(url).send().await.expect("send request");
+                    assert_eq!(res.status(), 200);
+                })
+            })
+            .collect();
+
+        server
+            .await_req_count(ITERATIONS, Duration::from_secs(1))
+            .await
+            .expect("requests finished");
+        assert_eq!(server.req_count(), ITERATIONS);
+
+        // Ensure all requests have finished.
+        for fut in futures {
+            fut.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn server_long_requests_cancellation() {
         async fn handler(
             _: Request<body::Incoming>,
@@ -422,14 +486,11 @@ mod test {
         let url = server.url("/").to_string();
         let futures: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = (0..ITERATIONS)
             .map(|_| {
-                println!("spawning request");
                 let client = client.clone();
                 let url = url.clone();
 
                 tokio::spawn(async move {
-                    println!("sending request");
                     let res = client.get(url).send().await;
-                    println!("res: {:?}", res);
                     match res {
                         Ok(_) => Err(anyhow::anyhow!("expected request to be canceled")),
                         Err(_) => Ok(()),
