@@ -12,11 +12,11 @@ keywords = ["http", "server", "test"]
 categories = ["development-tools::testing", "web-programming::http-server"]
 
 [dependencies]
-anyhow = "1.0"
 async-trait = "0.1"
-http-body-util = "0.1.0-rc.1"
-hyper = { version = "1.0.0-rc.1", features = ["http1", "server"] }
-tokio = { version = "1.23", features = ["full"] }
+http-body-util = "0.1.0-rc.2"
+hyper = { version = "1.0.0-rc.2", features = ["http1", "server"] }
+thiserror = "1.0"
+tokio = { version = "1.24", features = ["full"] }
 
 [dev-dependencies]
 reqwest = "0.11"

@@ -8,7 +8,8 @@ Small library that provides a simple Hyper server wrapper for writing HTTP test
 servers. Vaguely inspired by Go's
 [httptest](https://pkg.go.dev/net/http/httptest#Server) package.
 
-Currently only supports HTTP/1.1 and does not support TLS.
+Currently only supports HTTP/1.1 and does not support TLS. Only supports the
+Tokio async runtime.
 
 ## Example
 
