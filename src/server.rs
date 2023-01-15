@@ -38,6 +38,10 @@ impl Server {
     /// final reference to the server is dropped, the server will be shut down
     /// and all pending requests will be aborted. Aborting the server will
     /// happen in the background and will not block.
+    ///
+    /// The remote socket address is added as a
+    /// [SocketAddr](std::net::SocketAddr)
+    /// [extension](hyper::Request::extensions) to the request object.
     pub async fn new<H: Handler + Clone + Send + Sync + 'static>(
         handler: H,
     ) -> Result<Self, Error> {
@@ -62,7 +66,7 @@ impl Server {
                 let mut close_rx = close_rx.clone();
 
                 loop {
-                    let (tcp_stream, _) = select! {
+                    let (tcp_stream, remote_addr) = select! {
                         _ = close_rx.changed() => {
                             return;
                         }
@@ -86,8 +90,9 @@ impl Server {
                         let req_count = &req_count;
                         let concurrent_req_count = &concurrent_req_count;
 
-                        let service = service_fn(|req: Request<body::Incoming>| async move {
+                        let service = service_fn(|mut req: Request<body::Incoming>| async move {
                             *concurrent_req_count.lock().expect("lock poisoned") += 1;
+                            req.extensions_mut().insert(remote_addr);
                             let res = run_handler(handler.clone(), req).await;
                             *concurrent_req_count.lock().expect("lock poisoned") -= 1;
                             *req_count.lock().expect("lock poisoned") += 1;
@@ -99,7 +104,7 @@ impl Server {
                                 return;
                             }
                             res = http1::Builder::new()
-                                .http1_keep_alive(true)
+                                .keep_alive(true)
                                 .serve_connection(tcp_stream, service) => res,
                         };
 
@@ -463,5 +468,46 @@ mod test {
             fut.await.unwrap().expect("request canceled");
         }
         assert!(now.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn server_keep_alive() {
+        let server = {
+            let last_socket_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+            Server::new(move |req: Request<body::Incoming>| async move {
+                let socket_addr = req.extensions().get::<SocketAddr>().unwrap();
+                let mut last_socket_addr = last_socket_addr.lock().expect("lock poisoned");
+                match *last_socket_addr {
+                    Some(last_socket_addr) => {
+                        assert_eq!(&last_socket_addr, socket_addr);
+                    }
+                    None => {
+                        *last_socket_addr = Some(*socket_addr);
+                    }
+                }
+
+                handle_ok(Response::new("hello world".into()))
+            })
+            .await
+            .expect("create server")
+        };
+
+        let client = reqwest::Client::new();
+
+        // Spawn 10 requests and ensure they all use the same socket.
+        static ITERATIONS: u64 = 10;
+        for i in 0..ITERATIONS {
+            let res = client
+                .get(server.url("/").to_string())
+                .send()
+                .await
+                .expect("send request");
+
+            assert_eq!(res.status(), 200);
+            assert_eq!(res.text().await.expect("read response"), "hello world");
+            assert_eq!(server.req_count(), i + 1);
+        }
+
+        assert_eq!(server.req_count(), ITERATIONS);
     }
 }
